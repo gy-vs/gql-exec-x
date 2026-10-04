@@ -329,6 +329,7 @@ export type {
   ExecutionArgs,
   ExecutionResult,
   FormattedExecutionResult,
+  FieldTiming,
 } from './execution/index';
 
 export type { SubscriptionArgs } from './subscription/index';

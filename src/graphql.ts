@@ -56,6 +56,9 @@ import { execute } from './execution/execute';
  *    A type resolver function to use when none is provided by the schema.
  *    If not provided, the default type resolver is used (which looks for a
  *    `__typename` field or alternatively calls the `isTypeOf` method).
+ * fieldTimings:
+ *    When true, the execution result contains an `extensions` property with
+ *    a `fieldTimings` array holding a timing entry for every executed field.
  */
 export interface GraphQLArgs {
   schema: GraphQLSchema;
@@ -66,6 +69,7 @@ export interface GraphQLArgs {
   operationName?: Maybe<string>;
   fieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
   typeResolver?: Maybe<GraphQLTypeResolver<any, any>>;
+  fieldTimings?: boolean;
 }
 
 export function graphql(args: GraphQLArgs): Promise<ExecutionResult> {
@@ -106,6 +110,7 @@ function graphqlImpl(args: GraphQLArgs): PromiseOrValue<ExecutionResult> {
     operationName,
     fieldResolver,
     typeResolver,
+    fieldTimings,
   } = args;
 
   // Validate Schema
@@ -138,5 +143,6 @@ function graphqlImpl(args: GraphQLArgs): PromiseOrValue<ExecutionResult> {
     operationName,
     fieldResolver,
     typeResolver,
+    fieldTimings,
   });
 }

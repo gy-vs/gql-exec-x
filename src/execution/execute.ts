@@ -6,6 +6,7 @@ import { isObjectLike } from '../jsutils/isObjectLike';
 import { isPromise } from '../jsutils/isPromise';
 import type { Maybe } from '../jsutils/Maybe';
 import { memoize3 } from '../jsutils/memoize3';
+import { now } from '../jsutils/now';
 import type { ObjMap } from '../jsutils/ObjMap';
 import type { Path } from '../jsutils/Path';
 import { addPath, pathToArray } from '../jsutils/Path';
@@ -115,6 +116,74 @@ export interface ExecutionContext {
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
   errors: Array<GraphQLError>;
+  fieldTimings?: FieldTimingsCollector;
+}
+
+/**
+ * Timing information for the execution of a single field, collected when the
+ * `fieldTimings` execution option is enabled.
+ */
+export interface FieldTiming {
+  /**
+   * The path of the field within the response, using the same format as the
+   * `path` property of GraphQL errors: the response name (the alias, if one
+   * was used) for object fields and the 0-based index for list items.
+   */
+  path: ReadonlyArray<string | number>;
+  /**
+   * The name of the field's parent object type, e.g. "Product".
+   */
+  parentType: string;
+  /**
+   * The name of the field as defined on the parent type.
+   */
+  fieldName: string;
+  /**
+   * The string representation of the field's return type,
+   * e.g. "Product" or "[Review!]!".
+   */
+  returnType: string;
+  /**
+   * The moment at which the field started executing, in milliseconds
+   * relative to the start of this execution. May include fractions of a
+   * millisecond.
+   */
+  startOffset: number;
+  /**
+   * The time spent resolving this field, in milliseconds, measured from the
+   * invocation of the field's resolver (fields without a custom resolver are
+   * timed through the default field resolver) until the field's own value
+   * was settled, awaiting a returned promise if necessary. The execution
+   * time of subfields is not included; each executed subfield is recorded as
+   * a separate entry.
+   */
+  duration: number;
+}
+
+/**
+ * State used to collect field timings over the course of a single execution.
+ *
+ * @internal
+ */
+export interface FieldTimingsCollector {
+  /** High-resolution timestamp marking the start of this execution. */
+  startTime: number;
+  /** Timing entries of all executed fields, in order of their completion. */
+  timings: Array<FieldTiming>;
+}
+
+/**
+ * Tracks the timing of a single field execution. Only created when the
+ * `fieldTimings` execution option is enabled.
+ */
+interface FieldTimingTracker {
+  /** Marks the moment the field's resolver is invoked. */
+  resolverCalled: () => void;
+  /**
+   * Records the timing entry for the field. Only the first call has an
+   * effect, any later calls are ignored.
+   */
+  end: () => void;
 }
 
 /**
@@ -152,6 +221,12 @@ export interface ExecutionArgs {
   fieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
   typeResolver?: Maybe<GraphQLTypeResolver<any, any>>;
   subscribeFieldResolver?: Maybe<GraphQLFieldResolver<any, any>>;
+  /**
+   * When true, the execution result contains an `extensions` property with
+   * a `fieldTimings` array holding a timing entry for every executed field.
+   * When not enabled, no timing takes place and the result is unchanged.
+   */
+  fieldTimings?: boolean;
 }
 
 /**
@@ -201,17 +276,17 @@ export function execute(args: ExecutionArgs): PromiseOrValue<ExecutionResult> {
     const result = executeOperation(exeContext, operation, rootValue);
     if (isPromise(result)) {
       return result.then(
-        (data) => buildResponse(data, exeContext.errors),
+        (data) => buildResponse(data, exeContext),
         (error) => {
           exeContext.errors.push(error);
-          return buildResponse(null, exeContext.errors);
+          return buildResponse(null, exeContext);
         },
       );
     }
-    return buildResponse(result, exeContext.errors);
+    return buildResponse(result, exeContext);
   } catch (error) {
     exeContext.errors.push(error);
-    return buildResponse(null, exeContext.errors);
+    return buildResponse(null, exeContext);
   }
 }
 
@@ -234,12 +309,21 @@ export function executeSync(args: ExecutionArgs): ExecutionResult {
 /**
  * Given a completed execution context and data, build the `{ errors, data }`
  * response defined by the "Response" section of the GraphQL specification.
+ *
+ * When the `fieldTimings` option is enabled, the collected timings are added
+ * under the `extensions` key of the response.
  */
 function buildResponse(
   data: ObjMap<unknown> | null,
-  errors: ReadonlyArray<GraphQLError>,
+  exeContext: ExecutionContext,
 ): ExecutionResult {
-  return errors.length === 0 ? { data } : { errors, data };
+  const { errors, fieldTimings } = exeContext;
+  const result: ExecutionResult =
+    errors.length === 0 ? { data } : { errors, data };
+  if (fieldTimings !== undefined) {
+    result.extensions = { fieldTimings: fieldTimings.timings };
+  }
+  return result;
 }
 
 /**
@@ -286,6 +370,7 @@ export function buildExecutionContext(
     fieldResolver,
     typeResolver,
     subscribeFieldResolver,
+    fieldTimings,
   } = args;
 
   let operation: OperationDefinitionNode | undefined;
@@ -321,7 +406,7 @@ export function buildExecutionContext(
     return [new GraphQLError('Must provide an operation.')];
   }
 
-  // FIXME: 
+  // FIXME:
   /* c8 ignore next */
   const variableDefinitions = operation.variableDefinitions ?? [];
 
@@ -347,6 +432,7 @@ export function buildExecutionContext(
     typeResolver: typeResolver ?? defaultTypeResolver,
     subscribeFieldResolver: subscribeFieldResolver ?? defaultFieldResolver,
     errors: [],
+    fieldTimings: fieldTimings ? { startTime: now(), timings: [] } : undefined,
   };
 }
 
@@ -503,6 +589,8 @@ function executeField(
     path,
   );
 
+  const timing = startFieldTiming(exeContext, parentType, fieldDef, path);
+
   // Get the resolve function, regardless of if its result is normal or abrupt (error).
   try {
     // Build a JS object of arguments from the field.arguments AST, using the
@@ -519,12 +607,22 @@ function executeField(
     // used to represent an authenticated user, or request-specific caches.
     const contextValue = exeContext.contextValue;
 
+    timing?.resolverCalled();
+
     const result = resolveFn(source, args, contextValue, info);
 
     let completed;
     if (isPromise(result)) {
       completed = result.then((resolved) =>
-        completeValue(exeContext, returnType, fieldNodes, info, path, resolved),
+        completeValue(
+          exeContext,
+          returnType,
+          fieldNodes,
+          info,
+          path,
+          resolved,
+          timing?.end,
+        ),
       );
     } else {
       completed = completeValue(
@@ -534,22 +632,74 @@ function executeField(
         info,
         path,
         result,
+        timing?.end,
       );
     }
 
     if (isPromise(completed)) {
       // Note: we don't rely on a `catch` method, but we do expect "thenable"
       // to take a second callback for the error case.
-      return completed.then(undefined, (rawError) => {
-        const error = locatedError(rawError, fieldNodes, pathToArray(path));
-        return handleFieldError(error, returnType, exeContext);
-      });
+      return completed.then(
+        (value) => {
+          timing?.end();
+          return value;
+        },
+        (rawError) => {
+          timing?.end();
+          const error = locatedError(rawError, fieldNodes, pathToArray(path));
+          return handleFieldError(error, returnType, exeContext);
+        },
+      );
     }
+    timing?.end();
     return completed;
   } catch (rawError) {
+    timing?.end();
     const error = locatedError(rawError, fieldNodes, pathToArray(path));
     return handleFieldError(error, returnType, exeContext);
   }
+}
+
+/**
+ * Begins tracking the execution of a field when the `fieldTimings` option is
+ * enabled, returning a tracker used to mark the resolver invocation and to
+ * record the field's timing entry. Returns undefined when timings are not
+ * being collected, in which case execution is completely unaffected.
+ */
+function startFieldTiming(
+  exeContext: ExecutionContext,
+  parentType: GraphQLObjectType,
+  fieldDef: GraphQLField<unknown, unknown>,
+  path: Path,
+): FieldTimingTracker | undefined {
+  const collector = exeContext.fieldTimings;
+  if (collector === undefined) {
+    return undefined;
+  }
+
+  const startTime = now();
+  let resolverStartTime = startTime;
+  let ended = false;
+
+  return {
+    resolverCalled() {
+      resolverStartTime = now();
+    },
+    end() {
+      if (ended) {
+        return;
+      }
+      ended = true;
+      collector.timings.push({
+        path: pathToArray(path),
+        parentType: parentType.name,
+        fieldName: fieldDef.name,
+        returnType: String(fieldDef.type),
+        startOffset: startTime - collector.startTime,
+        duration: now() - resolverStartTime,
+      });
+    },
+  };
 }
 
 /**
@@ -623,6 +773,7 @@ function completeValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
+  endTiming?: () => void,
 ): PromiseOrValue<unknown> {
   // If result is an Error, throw a located error.
   if (result instanceof Error) {
@@ -639,6 +790,7 @@ function completeValue(
       info,
       path,
       result,
+      endTiming,
     );
     if (completed === null) {
       throw new Error(
@@ -662,6 +814,7 @@ function completeValue(
       info,
       path,
       result,
+      endTiming,
     );
   }
 
@@ -681,6 +834,7 @@ function completeValue(
       info,
       path,
       result,
+      endTiming,
     );
   }
 
@@ -693,6 +847,7 @@ function completeValue(
       info,
       path,
       result,
+      endTiming,
     );
   }
   /* c8 ignore next 6 */
@@ -714,6 +869,7 @@ function completeListValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
+  endTiming?: () => void,
 ): PromiseOrValue<ReadonlyArray<unknown>> {
   if (!isIterableObject(result)) {
     throw new GraphQLError(
@@ -740,6 +896,7 @@ function completeListValue(
             info,
             itemPath,
             resolved,
+            endTiming,
           ),
         );
       } else {
@@ -750,6 +907,7 @@ function completeListValue(
           info,
           itemPath,
           item,
+          endTiming,
         );
       }
 
@@ -805,6 +963,7 @@ function completeAbstractValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
+  endTiming?: () => void,
 ): PromiseOrValue<ObjMap<unknown>> {
   const resolveTypeFn = returnType.resolveType ?? exeContext.typeResolver;
   const contextValue = exeContext.contextValue;
@@ -826,6 +985,7 @@ function completeAbstractValue(
         info,
         path,
         result,
+        endTiming,
       ),
     );
   }
@@ -844,6 +1004,7 @@ function completeAbstractValue(
     info,
     path,
     result,
+    endTiming,
   );
 }
 
@@ -912,6 +1073,7 @@ function completeObjectValue(
   info: GraphQLResolveInfo,
   path: Path,
   result: unknown,
+  endTiming?: () => void,
 ): PromiseOrValue<ObjMap<unknown>> {
   // Collect sub-fields to execute to complete this value.
   const subFieldNodes = collectSubfields(exeContext, returnType, fieldNodes);
@@ -927,6 +1089,9 @@ function completeObjectValue(
         if (!resolvedIsTypeOf) {
           throw invalidReturnTypeError(returnType, result, fieldNodes);
         }
+        // The field's own value is settled at this point, only the execution
+        // of its subfields remains, which is timed separately.
+        endTiming?.();
         return executeFields(
           exeContext,
           returnType,
@@ -942,6 +1107,9 @@ function completeObjectValue(
     }
   }
 
+  // The field's own value is settled at this point, only the execution of
+  // its subfields remains, which is timed separately.
+  endTiming?.();
   return executeFields(exeContext, returnType, result, path, subFieldNodes);
 }
 

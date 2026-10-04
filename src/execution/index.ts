@@ -11,6 +11,7 @@ export type {
   ExecutionArgs,
   ExecutionResult,
   FormattedExecutionResult,
+  FieldTiming,
 } from './execute';
 
 export { subscribe, createSourceEventStream } from './subscribe';
